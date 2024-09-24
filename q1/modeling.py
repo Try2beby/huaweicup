@@ -100,7 +100,9 @@ class MLP(nn.Module):
         return predictions.numpy().flatten()  # Convert predictions to numpy array
 
 
-def regressor(X, y, model_type="random_forest", n_splits=5, random_state=42):
+def regressor(
+    X, y, model_type="random_forest", n_splits=5, random_state=42, suffix="2ap"
+):
     """
     参数:
     - X: 特征数据集 (pandas DataFrame)
@@ -112,6 +114,9 @@ def regressor(X, y, model_type="random_forest", n_splits=5, random_state=42):
     # 创建 KFold 交叉验证器
     kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
     results = {}
+
+    # 记录训练集和测试集的指标
+    metrics = dict(mse=dict(train=[], test=[]), r2=dict(train=[], test=[]))
 
     # 根据 model_type 选择回归模型
     if model_type == "random_forest":
@@ -137,9 +142,6 @@ def regressor(X, y, model_type="random_forest", n_splits=5, random_state=42):
     else:
         raise ValueError
 
-    mse_scores = []
-    r2_scores = []
-
     # 用于存储所有 SHAP 值
     all_shap_values = []
 
@@ -148,15 +150,27 @@ def regressor(X, y, model_type="random_forest", n_splits=5, random_state=42):
         X_train, X_test = X.iloc[train_index], X.iloc[test_index]
         y_train, y_test = y.iloc[train_index], y.iloc[test_index]
 
+        # # 对 X_train, X_test 做归一化处理
+        # scaler = StandardScaler()
+        # X_train = scaler.fit_transform(X_train)
+        # X_test = scaler.transform(X_test)
+
         # 训练模型
         model.fit(X_train, y_train)
 
-        # 进行预测
-        y_pred = model.predict(X_test)
+        # 在训练集上进行预测并计算指标
+        y_train_pred = model.predict(X_train)
+        train_mse = mean_squared_error(y_train, y_train_pred)
+        train_r2 = r2_score(y_train, y_train_pred)
+        metrics["mse"]["train"].append(train_mse)
+        metrics["r2"]["train"].append(train_r2)
 
-        # 评估模型
-        mse_scores.append(mean_squared_error(y_test, y_pred))
-        r2_scores.append(r2_score(y_test, y_pred))
+        # 在测试集上进行预测并计算指标
+        y_test_pred = model.predict(X_test)
+        test_mse = mean_squared_error(y_test, y_test_pred)
+        test_r2 = r2_score(y_test, y_test_pred)
+        metrics["mse"]["test"].append(test_mse)
+        metrics["r2"]["test"].append(test_r2)
 
         # 计算 SHAP 值
         if explainer_type == "tree":
@@ -172,12 +186,6 @@ def regressor(X, y, model_type="random_forest", n_splits=5, random_state=42):
             shap_values = explainer.shap_values(X_test_tensor)
             all_shap_values.append(np.mean(shap_values, axis=0))
 
-    # 输出交叉验证结果
-    print(f"Mean Squared Error (MSE) scores: {mse_scores}")
-    print(f"Average MSE: {np.mean(mse_scores)}")
-    print(f"R^2 scores: {r2_scores}")
-    print(f"Average R^2: {np.mean(r2_scores)}")
-
     # 输出 SHAP 值结果
     if explainer_type in ["tree", "deep"]:
         avg_shap_values = np.mean(all_shap_values, axis=0).flatten()
@@ -185,10 +193,29 @@ def regressor(X, y, model_type="random_forest", n_splits=5, random_state=42):
         shap_df = pd.DataFrame(
             {"Feature": feature_names, "SHAP Value": avg_shap_values}
         )
-        shap_df = shap_df.sort_values(by="SHAP Value", ascending=False)
+        shap_df["SHAP Sign"] = np.sign(shap_df["SHAP Value"])
+        # sort by absolute value of SHAP value
+        shap_df = shap_df.reindex(
+            shap_df["SHAP Value"].abs().sort_values(ascending=False).index
+        )
+        positive_shap_df = shap_df[shap_df["SHAP Value"] > 0].copy()
+        negative_shap_df = shap_df[shap_df["SHAP Value"] < 0].copy()
+        positive_shap_df = positive_shap_df.reindex(
+            positive_shap_df["SHAP Value"].abs().sort_values(ascending=False).index
+        )
+        negative_shap_df = negative_shap_df.reindex(
+            negative_shap_df["SHAP Value"].abs().sort_values(ascending=False).index
+        )
         results["shap_values"] = shap_df
-        print("\nSHAP Values:")
-        print(shap_df)
+
+        print("\n正向影响的 SHAP 值 (按绝对值排序):")
+        print(positive_shap_df)
+
+        print("\n负向影响的 SHAP 值 (按绝对值排序):")
+        print(negative_shap_df)
+
+        results["positive_shap_values"] = positive_shap_df
+        results["negative_shap_values"] = negative_shap_df
 
     # 如果模型有特征重要性，输出特征重要性
     if hasattr(model, "feature_importances_"):
@@ -207,5 +234,16 @@ def regressor(X, y, model_type="random_forest", n_splits=5, random_state=42):
 
     else:
         print(f"{model_type} model does not support feature importance.")
+
+    print(metrics)
+    # turn values of metrics into dataframe
+    for key, value in metrics.items():
+        metrics[key] = pd.DataFrame(value)
+    results.update(metrics)
+
+    # save results
+    with pd.ExcelWriter(f"results_{model_type}_{suffix}.xlsx") as writer:
+        for sheet_name, df in results.items():
+            df.to_excel(writer, sheet_name=sheet_name)
 
     return results
