@@ -1,6 +1,8 @@
+import random
 import re
 
 import lightgbm as lgb
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import shap
@@ -9,15 +11,13 @@ import torch.nn as nn
 import torch.optim as optim
 import xgboost as xgb
 from catboost import CatBoostRegressor
+from matplotlib_inline import backend_inline
 from sklearn.ensemble import ExtraTreesRegressor, RandomForestRegressor
-from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import RBF
-from sklearn.gaussian_process.kernels import ConstantKernel as C
-from sklearn.linear_model import ElasticNet
 from sklearn.metrics import mean_squared_error, r2_score
 from sklearn.model_selection import KFold
 from sklearn.preprocessing import StandardScaler
-from sklearn.svm import SVR
+
+backend_inline.set_matplotlib_formats("svg")
 
 
 def clear_column_names(df):
@@ -47,9 +47,11 @@ class MLP(nn.Module):
         output_size=1,
         lr=0.001,
         batch_size=64,
+        weight_decay=1e-5,
     ):
         super(MLP, self).__init__()
         # Define network layers
+        # print(input_size, hidden_size1)
         self.fc1 = nn.Linear(input_size, hidden_size1)
         self.fc2 = nn.Linear(hidden_size1, hidden_size2)
         self.fc3 = nn.Linear(hidden_size2, output_size)
@@ -57,6 +59,7 @@ class MLP(nn.Module):
 
         self.lr = lr
         self.batch_size = batch_size
+        self.weight_decay = weight_decay
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         # self.device = torch.device("cpu")
@@ -86,9 +89,10 @@ class MLP(nn.Module):
     def fit(self, X_train, y_train, epochs=600):
         lr = self.lr
         batch_size = self.batch_size
+        weight_decay = self.weight_decay
 
         self.train()  # Set the model in training mode
-        optimizer = optim.Adam(self.parameters(), lr=lr, weight_decay=1e-5)
+        optimizer = optim.Adam(self.parameters(), lr=lr, weight_decay=weight_decay)
         # optimizer = optim.Adam(self.parameters(), lr=lr)
         criterion = nn.MSELoss()
         scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=200, gamma=0.1)
@@ -145,8 +149,105 @@ class MLP(nn.Module):
         return predictions.numpy().flatten()  # Convert predictions to numpy array
 
 
+def random_search(param_dict, n_trials=10, **kwargs):
+    import json
+
+    # 存储搜索结果
+    results = {}
+    best_result = None
+    best_mean_test_r2 = -np.inf
+    best_params = None
+
+    for _ in range(n_trials):
+        params = {}
+        for key, value in param_dict.items():
+            if isinstance(value, list):
+                params[key] = random.choice(value)  # 从列表中随机选择
+            else:
+                params[key] = value
+
+        print(f"\nParams: {params}")
+        _result = regressor(params=params, **kwargs)
+        if _result["r2"]["test"].mean() > best_mean_test_r2:
+            best_result = _result
+            best_mean_test_r2 = _result["r2"]["test"].mean()
+            best_params = params
+
+        params_str = json.dumps(params, sort_keys=True)
+        results[params_str] = _result
+
+    # save best result
+    df_best_params = pd.DataFrame(best_params.items(), columns=["Parameter", "Value"])
+    # 添加 Search List 列，包含对应参数的搜索列表
+    df_best_params["Search List"] = df_best_params["Parameter"].apply(
+        lambda x: param_dict[x] if x in param_dict else None
+    )
+
+    # save best result
+    best_result["best_params"] = df_best_params
+    model_type = kwargs.get("model_type", "random_forest")
+    suffix = kwargs.get("suffix", "2ap")
+    with pd.ExcelWriter(f"./results/results_{model_type}_{suffix}.xlsx") as writer:
+        for sheet_name, df in best_result.items():
+            df.to_excel(writer, sheet_name=sheet_name)
+
+    return dict(
+        best_params=best_params,
+        best_result=best_result,
+        best_mean_test_r2=best_mean_test_r2,
+    ), results
+
+
+def model_selection(model_type, params, random_state=42, input_size=-1, output_size=-1):
+    # 根据 model_type 选择回归模型
+    if model_type == "random_forest":
+        model = RandomForestRegressor(**params, random_state=random_state)
+        explainer_type = "tree"
+    elif model_type == "extra_trees":
+        model = ExtraTreesRegressor(**params, random_state=random_state)
+        explainer_type = "tree"
+    elif model_type == "xgboost":
+        model = xgb.XGBRegressor(
+            # objective="reg:squarederror",
+            # n_estimators=100,
+            # max_depth=3,
+            # learning_rate=0.1,
+            **params,
+            random_state=random_state,
+        )
+        explainer_type = "tree"
+    elif model_type == "catboost":
+        model = CatBoostRegressor(
+            # iterations=100,
+            # learning_rate=0.1,
+            # depth=3,
+            **params,
+        )
+        explainer_type = "tree"
+    elif model_type == "lightgbm":
+        _params = {
+            "objective": "regression",
+            "metric": "rmse",
+            "learning_rate": 0.1,
+            "num_leaves": 31,
+            "min_data_in_leaf": 20,
+            "feature_fraction": 0.9,
+            "early_stopping_round": 10,
+        }
+        _params.update(params)
+        model = lgb.LGBMRegressor(**_params)
+        explainer_type = "tree"
+    elif model_type == "mlp":
+        model = MLP(**params, input_size=input_size)
+        explainer_type = "deep"
+
+    else:
+        raise ValueError(f"Invalid model_type: {model_type}")
+    return model, explainer_type
+
+
 def regressor(
-    X, y, model_type="random_forest", n_splits=5, random_state=42, suffix="2ap"
+    X, y, params, model_type="random_forest", n_splits=5, random_state=42, suffix="2ap"
 ):
     # 创建 KFold 交叉验证器
     kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
@@ -160,55 +261,9 @@ def regressor(
 
     # K 折交叉验证
     for train_index, test_index in kf.split(X):
-        # 根据 model_type 选择回归模型
-        if model_type == "random_forest":
-            model = RandomForestRegressor(n_estimators=100, random_state=random_state)
-            explainer_type = "tree"
-        elif model_type == "xgboost":
-            model = xgb.XGBRegressor(
-                objective="reg:squarederror",
-                n_estimators=100,
-                max_depth=3,
-                learning_rate=0.1,
-                random_state=random_state,
-            )
-            explainer_type = "tree"
-        elif model_type == "svr":
-            model = SVR(
-                kernel="rbf", C=30, epsilon=0.001
-            )  # 使用 RBF 核函数，C 和 epsilon 为默认值
-            explainer_type = None  # 不支持 SHAP explainer
-        elif model_type == "mlp":
-            model = MLP(input_size=X.shape[1])
-            explainer_type = "deep"
-
-        elif model_type == "lightgbm":
-            params = {
-                "objective": "regression",
-                "metric": "rmse",
-                "learning_rate": 0.1,
-                "num_leaves": 31,
-                "min_data_in_leaf": 20,
-                "feature_fraction": 0.9,
-                "early_stopping_round": 10,
-            }
-            model = lgb.LGBMRegressor(**params)
-            explainer_type = "tree"
-        elif model_type == "extra_trees":
-            model = ExtraTreesRegressor(n_estimators=100, random_state=random_state)
-            explainer_type = "tree"
-        elif model_type == "elastic_net":
-            model = ElasticNet(alpha=1e-2, l1_ratio=1e-2, max_iter=10000)
-            explainer_type = None
-        elif model_type == "gp":
-            kernel = C(1.0, (1e-3, 1e3)) * RBF(10.0, (1e-2, 1e2))
-            model = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=10)
-            explainer_type = None
-        elif model_type == "catboost":
-            model = CatBoostRegressor(iterations=100, learning_rate=0.1, depth=3)
-            explainer_type = "tree"
-        else:
-            raise ValueError
+        model, explainer_type = model_selection(
+            model_type, params, random_state=random_state, input_size=X.shape[1]
+        )
 
         X_train, X_test = X.iloc[train_index], X.iloc[test_index]
         y_train, y_test = y.iloc[train_index], y.iloc[test_index]
@@ -274,13 +329,9 @@ def regressor(
         )
         importance_df = importance_df.sort_values(by="Importance", ascending=False)
 
-        # # 验证特征重要性之和为 1
-        # assert np.isclose(
-        #     importance_df.Importance.sum(), 1.0
-        # ), f"Feature importance sum is not 1.0, got {importance_df.Importance.sum()}"
         results["feature_importances"] = importance_df
-        print("\nFeature Importances:")
-        print(importance_df)
+        # print("\nFeature Importances:")
+        # print(importance_df)
 
     else:
         print(f"{model_type} model does not support feature importance.")
@@ -291,9 +342,81 @@ def regressor(
         metrics[key] = pd.DataFrame(value)
     results.update(metrics)
 
-    # save results
-    with pd.ExcelWriter(f"./results/results_{model_type}_{suffix}.xlsx") as writer:
-        for sheet_name, df in results.items():
-            df.to_excel(writer, sheet_name=sheet_name)
+    # # save results
+    # with pd.ExcelWriter(f"./results/results_{model_type}_{suffix}.xlsx") as writer:
+    #     for sheet_name, df in results.items():
+    #         df.to_excel(writer, sheet_name=sheet_name)
 
     return results
+
+
+class regressor_final:
+    def __init__(
+        self, params, model_type="random_forest", random_state=42, suffix="2ap"
+    ):
+        self.model_type = model_type
+        self.suffix = suffix
+
+        self.model, _ = model_selection(model_type, params, random_state=random_state)
+
+    def fit(self, X, y):
+        self.model.fit(X, y)
+
+    def plot_fit_error(self, X, y):
+        y_pred = self.model.predict(X)
+
+        # 计算均方误差
+        mse = np.mean((y - y_pred) ** 2)
+
+        # 绘制真实值 vs 预测值图
+        plt.figure(figsize=(10, 6))
+        plt.scatter(y, y_pred, alpha=0.5)
+        plt.plot([y.min(), y.max()], [y.min(), y.max()], "r--")  # 45-degree line
+        plt.title("MSE Distribution")
+        plt.xlabel("True Values")
+        plt.ylabel("Predicted Values")
+        plt.text(
+            0.5,
+            0.1,
+            f"MSE: {mse:.2f}",
+            transform=plt.gca().transAxes,
+            fontsize=12,
+            ha="center",
+        )
+
+        # 设置坐标范围，从零开始
+        plt.xlim(0, max(y.max(), y_pred.max()))
+        plt.ylim(0, max(y.max(), y_pred.max()))
+
+        # 坐标刻度一致
+        plt.axis("equal")
+
+        # 去除上、右边框
+        plt.gca().spines["top"].set_visible(False)
+        plt.gca().spines["right"].set_visible(False)
+
+        # save
+        plt.savefig(f"./fig/{self.model_type}_{self.suffix}_train_mse.svg")
+        plt.show()
+
+        # 计算误差
+        errors = y - y_pred
+
+        # 绘制误差图
+        plt.figure(figsize=(10, 6))
+        plt.hist(errors, bins=30, alpha=0.5, color="b", edgecolor="black")
+        plt.title("Error Distribution")
+        plt.xlabel("Error (True - Predicted)")
+        plt.ylabel("Frequency")
+        plt.axvline(0, color="red", linestyle="dashed", linewidth=1)  # 0误差线
+        # 去除上、右边框
+        plt.gca().spines["top"].set_visible(False)
+        plt.gca().spines["right"].set_visible(False)
+
+        # save
+        plt.savefig(f"./fig/{self.model_type}_{self.suffix}_train_error.svg")
+
+        plt.show()
+
+    def predict(self, X):
+        y_pred = self.model.predict(X)
