@@ -2,3 +2,4 @@ temp/
 __pycache__/
 test*
 catboost_info/
+!test*.csv
